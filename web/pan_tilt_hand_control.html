@@ -1,0 +1,786 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pan Tilt Hand Controller</title>
+
+<style>
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: #000;
+  color: white;
+  font-family: Arial, sans-serif;
+}
+
+.controls {
+  padding: 12px;
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: #111;
+}
+
+button {
+  min-height: 44px;
+  padding: 10px 16px;
+  border: none;
+  border-radius: 8px;
+  font-size: 15px;
+  cursor: pointer;
+  color: white;
+}
+
+#cameraButton { background: #2e7d32; }
+#connectButton { background: #1565c0; }
+#motionButton { background: #e07800; }
+#centerButton { background: #6741b7; }
+
+.reverseControls {
+  display: flex;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 25px;
+  padding: 10px;
+  background: #151515;
+}
+
+.reverseControls label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 15px;
+}
+
+#status {
+  padding: 8px;
+  text-align: center;
+  min-height: 38px;
+}
+
+#mode {
+  padding: 8px;
+  text-align: center;
+  font-size: 21px;
+  font-weight: bold;
+  color: #00ff88;
+}
+
+.videoBox {
+  position: relative;
+  width: min(calc(100% - 20px), 900px);
+  margin: auto;
+  aspect-ratio: 16 / 9;
+  background: black;
+  overflow: hidden;
+  border-radius: 12px;
+}
+
+video {
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0;
+  pointer-events: none;
+}
+
+canvas {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  background: black;
+  transform: scaleX(-1);
+  pointer-events: none;
+}
+
+.values {
+  max-width: 500px;
+  margin: 15px auto;
+  padding: 0 10px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.valueBox {
+  padding: 15px;
+  background: #151515;
+  border-radius: 10px;
+  text-align: center;
+}
+
+.angle {
+  margin-top: 7px;
+  font-size: 32px;
+  font-weight: bold;
+}
+
+.activeControl {
+  border: 2px solid #00ff88;
+}
+
+.good { color: #00ff88; }
+.warning { color: #ffb74d; }
+</style>
+</head>
+
+<body>
+
+<div class="controls">
+  <button id="cameraButton">Start Camera</button>
+  <button id="connectButton">Connect Arduino</button>
+  <button id="motionButton">Enable Servo Motion</button>
+  <button id="centerButton">Center</button>
+</div>
+
+<div class="reverseControls">
+  <label><input type="checkbox" id="reversePan"> Reverse PAN</label>
+  <label><input type="checkbox" id="reverseTilt"> Reverse TILT</label>
+</div>
+
+<div id="status">Loading hand tracker...</div>
+<div id="mode">NO GESTURE</div>
+
+<div class="videoBox">
+  <video id="video" autoplay playsinline></video>
+  <canvas id="canvas"></canvas>
+</div>
+
+<div class="values">
+  <div class="valueBox" id="panBox">
+    PAN — D3
+    <div class="angle" id="panValue">90°</div>
+  </div>
+
+  <div class="valueBox" id="tiltBox">
+    TILT — D5
+    <div class="angle" id="tiltValue">90°</div>
+  </div>
+</div>
+
+<script type="module">
+import {
+  HandLandmarker,
+  FilesetResolver,
+  DrawingUtils
+}
+from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/vision_bundle.mjs";
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+
+const cameraButton = document.getElementById("cameraButton");
+const connectButton = document.getElementById("connectButton");
+const motionButton = document.getElementById("motionButton");
+const centerButton = document.getElementById("centerButton");
+
+const reversePan = document.getElementById("reversePan");
+const reverseTilt = document.getElementById("reverseTilt");
+
+const statusElement = document.getElementById("status");
+const modeElement = document.getElementById("mode");
+
+const panValue = document.getElementById("panValue");
+const tiltValue = document.getElementById("tiltValue");
+
+const panBox = document.getElementById("panBox");
+const tiltBox = document.getElementById("tiltBox");
+
+let handLandmarker = null;
+let drawingUtils = null;
+let cameraRunning = false;
+let cameraStream = null;
+let lastVideoTime = -1;
+
+let port = null;
+let writer = null;
+let serialConnected = false;
+let serialBusy = false;
+let motionEnabled = false;
+let lastSendTime = 0;
+
+const SEND_INTERVAL = 33;
+
+let pan = 90;
+let tilt = 90;
+let filteredPan = 90;
+let filteredTilt = 90;
+
+const CONTROL_SMOOTHING = 0.16;
+const CONTROL_DEADBAND = 0.7;
+
+const PAN_MIN = 20;
+const PAN_MAX = 160;
+const TILT_MIN = 20;
+const TILT_MAX = 160;
+
+let candidateGesture = "NONE";
+let candidateFrames = 0;
+let activeGesture = "NONE";
+
+const GESTURE_LOCK_FRAMES = 3;
+
+let smoothLandmarks = null;
+const LANDMARK_SMOOTHING = 0.40;
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function mapRange(value, inMin, inMax, outMin, outMax) {
+  value = clamp(value, inMin, inMax);
+
+  return (
+    outMin +
+    ((value - inMin) * (outMax - outMin) / (inMax - inMin))
+  );
+}
+
+function angle3D(a, b, c) {
+  if (!a || !b || !c) return 0;
+
+  const abx = a.x - b.x;
+  const aby = a.y - b.y;
+  const abz = (a.z || 0) - (b.z || 0);
+
+  const cbx = c.x - b.x;
+  const cby = c.y - b.y;
+  const cbz = (c.z || 0) - (b.z || 0);
+
+  const dot = abx * cbx + aby * cby + abz * cbz;
+
+  const mag1 = Math.sqrt(abx * abx + aby * aby + abz * abz);
+  const mag2 = Math.sqrt(cbx * cbx + cby * cby + cbz * cbz);
+
+  if (mag1 < 0.00001 || mag2 < 0.00001) return 0;
+
+  let cosine = dot / (mag1 * mag2);
+  cosine = clamp(cosine, -1, 1);
+
+  return Math.acos(cosine) * 180 / Math.PI;
+}
+
+function fingerState(hand, mcp, pip, dip, tip) {
+  const angle1 = angle3D(hand[mcp], hand[pip], hand[dip]);
+  const angle2 = angle3D(hand[pip], hand[dip], hand[tip]);
+
+  const average = (angle1 + angle2) / 2;
+
+  if (average > 150) return "EXTENDED";
+  if (average < 133) return "FOLDED";
+
+  return "UNCERTAIN";
+}
+
+function classifyGesture(hand) {
+  const index = fingerState(hand, 5, 6, 7, 8);
+  const middle = fingerState(hand, 9, 10, 11, 12);
+  const ring = fingerState(hand, 13, 14, 15, 16);
+  const pinky = fingerState(hand, 17, 18, 19, 20);
+
+  if (
+    index === "EXTENDED" &&
+    middle === "FOLDED" &&
+    ring === "FOLDED" &&
+    pinky === "FOLDED"
+  ) {
+    return "PAN";
+  }
+
+  if (
+    index === "EXTENDED" &&
+    middle === "EXTENDED" &&
+    ring === "FOLDED" &&
+    pinky === "FOLDED"
+  ) {
+    return "TILT";
+  }
+
+  return "NONE";
+}
+
+function updateGestureLock(gesture) {
+  if (gesture === candidateGesture) {
+    candidateFrames++;
+  } else {
+    candidateGesture = gesture;
+    candidateFrames = 1;
+  }
+
+  if (candidateFrames >= GESTURE_LOCK_FRAMES) {
+    activeGesture = candidateGesture;
+  }
+}
+
+function smoothHandLandmarks(landmarks) {
+  if (!smoothLandmarks) {
+    smoothLandmarks = landmarks.map(
+      p => ({
+        x: p.x,
+        y: p.y,
+        z: p.z || 0
+      })
+    );
+
+    return smoothLandmarks;
+  }
+
+  for (let i = 0; i < landmarks.length; i++) {
+    smoothLandmarks[i].x +=
+      (landmarks[i].x - smoothLandmarks[i].x) *
+      LANDMARK_SMOOTHING;
+
+    smoothLandmarks[i].y +=
+      (landmarks[i].y - smoothLandmarks[i].y) *
+      LANDMARK_SMOOTHING;
+
+    smoothLandmarks[i].z +=
+      ((landmarks[i].z || 0) - smoothLandmarks[i].z) *
+      LANDMARK_SMOOTHING;
+  }
+
+  return smoothLandmarks;
+}
+
+function drawHand(result) {
+  ctx.fillStyle = "#000000";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  if (!result.landmarks || result.landmarks.length === 0) {
+    smoothLandmarks = null;
+    return;
+  }
+
+  const landmarks = smoothHandLandmarks(result.landmarks[0]);
+
+  drawingUtils.drawConnectors(
+    landmarks,
+    HandLandmarker.HAND_CONNECTIONS,
+    {
+      color: "#00ff88",
+      lineWidth: 5
+    }
+  );
+
+  drawingUtils.drawLandmarks(
+    landmarks,
+    {
+      color: "#ffffff",
+      fillColor: "#00ff88",
+      radius: 5
+    }
+  );
+}
+
+function processHand(result) {
+  panBox.classList.remove("activeControl");
+  tiltBox.classList.remove("activeControl");
+
+  if (!result.landmarks || result.landmarks.length === 0) {
+    updateGestureLock("NONE");
+    modeElement.textContent = "NO HAND";
+    return;
+  }
+
+  const screen = result.landmarks[0];
+
+  const world =
+    result.worldLandmarks?.[0] ||
+    result.landmarks[0];
+
+  const gesture = classifyGesture(world);
+  updateGestureLock(gesture);
+
+  if (activeGesture === "PAN") {
+    modeElement.textContent = "PAN — INDEX LEFT / RIGHT";
+    panBox.classList.add("activeControl");
+
+    let normalized = mapRange(
+      screen[8].x,
+      0.18,
+      0.82,
+      0,
+      1
+    );
+
+    if (reversePan.checked) {
+      normalized = 1 - normalized;
+    }
+
+    const desiredPan =
+      PAN_MIN +
+      normalized *
+      (PAN_MAX - PAN_MIN);
+
+    filteredPan +=
+      (desiredPan - filteredPan) *
+      CONTROL_SMOOTHING;
+
+    if (Math.abs(filteredPan - pan) > CONTROL_DEADBAND) {
+      pan = filteredPan;
+    }
+  }
+
+  else if (activeGesture === "TILT") {
+    modeElement.textContent = "TILT — 2 FINGERS UP / DOWN";
+    tiltBox.classList.add("activeControl");
+
+    const y =
+      (screen[8].y + screen[12].y) /
+      2;
+
+    let normalized = mapRange(
+      y,
+      0.18,
+      0.82,
+      0,
+      1
+    );
+
+    if (reverseTilt.checked) {
+      normalized = 1 - normalized;
+    }
+
+    const desiredTilt =
+      TILT_MIN +
+      normalized *
+      (TILT_MAX - TILT_MIN);
+
+    filteredTilt +=
+      (desiredTilt - filteredTilt) *
+      CONTROL_SMOOTHING;
+
+    if (Math.abs(filteredTilt - tilt) > CONTROL_DEADBAND) {
+      tilt = filteredTilt;
+    }
+  }
+
+  else {
+    modeElement.textContent = "NO CONTROL GESTURE";
+  }
+
+  panValue.textContent = Math.round(pan) + "°";
+  tiltValue.textContent = Math.round(tilt) + "°";
+
+  sendServoValues();
+}
+
+async function loadMediaPipe() {
+  const vision =
+    await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm"
+    );
+
+  const options = {
+    baseOptions: {
+      modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate: "GPU"
+    },
+
+    runningMode: "VIDEO",
+    numHands: 1,
+
+    minHandDetectionConfidence: 0.70,
+    minHandPresenceConfidence: 0.70,
+    minTrackingConfidence: 0.70
+  };
+
+  try {
+    handLandmarker =
+      await HandLandmarker.createFromOptions(
+        vision,
+        options
+      );
+  }
+
+  catch (error) {
+    delete options.baseOptions.delegate;
+
+    handLandmarker =
+      await HandLandmarker.createFromOptions(
+        vision,
+        options
+      );
+  }
+
+  drawingUtils = new DrawingUtils(ctx);
+
+  statusElement.innerHTML =
+    '<span class="good">Hand tracker ready</span>';
+}
+
+const modelPromise = loadMediaPipe();
+
+cameraButton.addEventListener(
+  "click",
+
+  async () => {
+    if (cameraRunning) {
+      stopCamera();
+      return;
+    }
+
+    try {
+      await modelPromise;
+
+      cameraStream =
+        await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            frameRate: { ideal: 60 },
+            facingMode: "user"
+          },
+
+          audio: false
+        });
+
+      video.srcObject = cameraStream;
+      await video.play();
+
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+
+      cameraRunning = true;
+      lastVideoTime = -1;
+
+      cameraButton.textContent = "Stop Camera";
+
+      requestAnimationFrame(trackingLoop);
+    }
+
+    catch (error) {
+      statusElement.textContent =
+        "Camera error: " +
+        error.message;
+    }
+  }
+);
+
+function stopCamera() {
+  cameraRunning = false;
+
+  if (cameraStream) {
+    cameraStream
+      .getTracks()
+      .forEach(
+        track => track.stop()
+      );
+  }
+
+  cameraStream = null;
+  video.srcObject = null;
+  smoothLandmarks = null;
+
+  cameraButton.textContent = "Start Camera";
+}
+
+connectButton.addEventListener(
+  "click",
+
+  async () => {
+    if (!("serial" in navigator)) {
+      statusElement.textContent =
+        "Use Chrome or Edge.";
+      return;
+    }
+
+    if (serialConnected) {
+      await disconnectArduino();
+      return;
+    }
+
+    try {
+      port =
+        await navigator.serial.requestPort();
+
+      await port.open({
+        baudRate: 115200
+      });
+
+      writer =
+        port.writable.getWriter();
+
+      serialConnected = true;
+
+      connectButton.textContent =
+        "Disconnect Arduino";
+
+      statusElement.innerHTML =
+        '<span class="good">Arduino connected</span>';
+
+      await new Promise(
+        resolve =>
+          setTimeout(
+            resolve,
+            1800
+          )
+      );
+    }
+
+    catch (error) {
+      statusElement.textContent =
+        "Arduino error: " +
+        error.message;
+    }
+  }
+);
+
+async function disconnectArduino() {
+  motionEnabled = false;
+
+  if (writer) {
+    writer.releaseLock();
+    writer = null;
+  }
+
+  if (port) {
+    try {
+      await port.close();
+    }
+    catch (error) {
+      console.error(error);
+    }
+
+    port = null;
+  }
+
+  serialConnected = false;
+
+  connectButton.textContent =
+    "Connect Arduino";
+
+  motionButton.textContent =
+    "Enable Servo Motion";
+}
+
+motionButton.addEventListener(
+  "click",
+
+  () => {
+    motionEnabled =
+      !motionEnabled;
+
+    motionButton.textContent =
+      motionEnabled
+      ? "Disable Servo Motion"
+      : "Enable Servo Motion";
+  }
+);
+
+centerButton.addEventListener(
+  "click",
+
+  () => {
+    pan = 90;
+    tilt = 90;
+
+    filteredPan = 90;
+    filteredTilt = 90;
+
+    panValue.textContent = "90°";
+    tiltValue.textContent = "90°";
+
+    sendRaw("90,90\n");
+  }
+);
+
+async function sendRaw(message) {
+  if (!writer || serialBusy) {
+    return;
+  }
+
+  try {
+    serialBusy = true;
+
+    await writer.write(
+      new TextEncoder()
+        .encode(message)
+    );
+  }
+
+  finally {
+    serialBusy = false;
+  }
+}
+
+async function sendServoValues() {
+  if (
+    !motionEnabled ||
+    !serialConnected ||
+    !writer
+  ) {
+    return;
+  }
+
+  const now = performance.now();
+
+  if (
+    now - lastSendTime <
+    SEND_INTERVAL
+  ) {
+    return;
+  }
+
+  lastSendTime = now;
+
+  await sendRaw(
+    Math.round(pan) +
+    "," +
+    Math.round(tilt) +
+    "\n"
+  );
+}
+
+function trackingLoop() {
+  if (!cameraRunning) {
+    return;
+  }
+
+  if (
+    video.readyState >= 2 &&
+    video.currentTime !== lastVideoTime
+  ) {
+    lastVideoTime = video.currentTime;
+
+    try {
+      const result =
+        handLandmarker.detectForVideo(
+          video,
+          performance.now()
+        );
+
+      drawHand(result);
+      processHand(result);
+
+      if (
+        result.landmarks &&
+        result.landmarks.length
+      ) {
+        statusElement.innerHTML =
+          '<span class="good">Hand detected</span>';
+      }
+      else {
+        statusElement.innerHTML =
+          '<span class="warning">Show your hand</span>';
+      }
+    }
+
+    catch (error) {
+      console.error(error);
+    }
+  }
+
+  requestAnimationFrame(trackingLoop);
+}
+</script>
+</body>
+</html>
